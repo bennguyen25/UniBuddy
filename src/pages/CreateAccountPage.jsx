@@ -311,7 +311,7 @@ const STEP_SUBTITLES = {
   3: 'Now, help us better understand your workstyle',
 }
 
-export default function CreateAccountPage() {
+export default function CreateAccountPage({ onComplete }) {
   const [step, setStep] = useState(1)
   const [formData, setFormData] = useState({
     fullName: '',
@@ -329,7 +329,7 @@ export default function CreateAccountPage() {
 
   const handleNext = () => {
     if (step < 3) setStep((s) => s + 1)
-    // step 3: handle final submission
+    else if (onComplete) onComplete()
   }
 
   return (
