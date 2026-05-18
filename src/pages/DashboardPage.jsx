@@ -1,4 +1,5 @@
-import { useState, useMemo, useEffect, useCallback } from 'react'
+import { useState, useMemo, useEffect, useCallback, useRef } from 'react'
+import ReactMarkdown from 'react-markdown'
 import canvasData from '../data/canvas-snapshot.json'
 import { initGoogleAuth, connectGoogleCalendar, isGoogleConnected, fetchCalendarEvents } from '../services/googleCalendar'
 import { auth } from '../firebase'
@@ -285,6 +286,11 @@ function WeeklyPanel({ courses, allTasks, onTaskClick, gcConnected, onConnectGC 
       {/* ── Canvas Workload View ── */}
       {!gcView && (
         <>
+          {/* Month label */}
+          <div style={{ fontSize: '0.8rem', fontWeight: 600, color: '#6b7280', marginBottom: '0.5rem', letterSpacing: '0.04em', flexShrink: 0 }}>
+            {visibleDays[1]?.fullDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}
+          </div>
+
           {/* Week navigation */}
           <div
             style={{
@@ -352,7 +358,24 @@ function WeeklyPanel({ courses, allTasks, onTaskClick, gcConnected, onConnectGC 
                   key={d.day}
                   style={{ flex: 1, overflowY: 'auto', paddingBottom: '0.5rem' }}
                 >
-                  {dayTasks.map((task) => (
+                  {dayTasks.length === 0 ? (
+                    <div
+                      style={{
+                        height: '100%',
+                        minHeight: '80px',
+                        backgroundColor: 'rgba(156, 163, 175, 0.12)',
+                        borderRadius: '10px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        padding: '1rem 0.5rem',
+                      }}
+                    >
+                      <span style={{ fontSize: '0.72rem', color: '#9ca3af', textAlign: 'center', lineHeight: 1.4 }}>
+                        No assignments today!
+                      </span>
+                    </div>
+                  ) : dayTasks.map((task) => (
                     <TaskCard key={task.id} task={task} courses={courses} onClick={onTaskClick} />
                   ))}
                 </div>
@@ -368,8 +391,65 @@ function WeeklyPanel({ courses, allTasks, onTaskClick, gcConnected, onConnectGC 
 
 // ─── Right Panel (AI Chat) ────────────────────────────────────────────────────
 
-function ChatPanel({ firstName }) {
+
+function ChatPanel({ firstName, allTasks }) {
   const [input, setInput] = useState('')
+  const [messages, setMessages] = useState([])
+  const [loading, setLoading] = useState(false)
+  const messagesEndRef = useRef(null)
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages, loading])
+
+  const buildContext = () => {
+    const sorted = [...allTasks]
+      .filter(t => t.dueDateISO)
+      .sort((a, b) => new Date(a.dueDateISO) - new Date(b.dueDateISO))
+
+    if (!sorted.length) return 'No assignments found.'
+
+    return sorted.map(t => {
+      const lines = [`[${t.course}] ${t.title}`, `Due: ${t.dueDate}`]
+      if (t.submissionType && t.submissionType !== 'none') lines.push(`Submission: ${t.submissionType.replace(/_/g, ' ')}`)
+      if (t.summary) lines.push(`Description: ${t.summary}`)
+      if (t.boldNote) lines.push(`Note: ${t.boldNote}`)
+      if (t.note) lines.push(`Note: ${t.note}`)
+      if (t.readings?.length) lines.push(`Readings: ${t.readings.join(', ')}`)
+      return lines.join('\n')
+    }).join('\n\n')
+  }
+
+  const sendMessage = async (text) => {
+    const userMsg = text.trim()
+    if (!userMsg || loading) return
+    setInput('')
+    const newMessages = [...messages, { role: 'user', text: userMsg }]
+    setMessages(newMessages)
+    setLoading(true)
+    try {
+      const systemPrompt = `You are Priorio, a helpful academic assistant for a student. You have access to their upcoming Canvas assignments:\n\n${buildContext()}\n\nToday's date is ${new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}. Help the student with questions about their assignments, due dates, study planning, and coursework. Be concise and friendly.`
+
+      const res = await fetch('/api/claude', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 1024,
+          system: systemPrompt,
+          messages: newMessages.map(m => ({ role: m.role, content: m.text })),
+        }),
+      })
+      const data = await res.json()
+      const reply = data?.content?.[0]?.text || 'Sorry, I couldn\'t get a response.'
+      setMessages(prev => [...prev, { role: 'assistant', text: reply }])
+    } catch {
+      setMessages(prev => [...prev, { role: 'assistant', text: 'Something went wrong. Please try again.' }])
+    }
+    setLoading(false)
+  }
+
+  const hasMessages = messages.length > 0
 
   return (
     <div
@@ -383,65 +463,106 @@ function ChatPanel({ firstName }) {
         overflow: 'hidden',
       }}
     >
-      {/* Greeting */}
-      <div
-        style={{
-          flex: 1,
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          padding: '2rem',
-        }}
-      >
-        <h2
-          style={{
-            fontFamily: "'Playfair Display', Georgia, serif",
-            fontSize: 'clamp(1.75rem, 2.5vw, 2.75rem)',
-            fontWeight: 900,
-            color: '#111827',
-            textAlign: 'center',
-            lineHeight: 1.25,
-            margin: 0,
-          }}
-        >
-          Hello {firstName},
-          <br />
-          How can I help you
-          <br />
-          today?
-        </h2>
-      </div>
+      {/* Greeting or chat history */}
+      {!hasMessages ? (
+        <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '2rem' }}>
+          <h2
+            style={{
+              fontFamily: "'Playfair Display', Georgia, serif",
+              fontSize: 'clamp(1.75rem, 2.5vw, 2.75rem)',
+              fontWeight: 900,
+              color: '#111827',
+              textAlign: 'center',
+              lineHeight: 1.25,
+              margin: 0,
+            }}
+          >
+            Hello {firstName},
+            <br />
+            How can I help you
+            <br />
+            today?
+          </h2>
+        </div>
+      ) : (
+        <div style={{ flex: 1, overflowY: 'auto', padding: '1.25rem 1.25rem 0.5rem' }}>
+          {messages.map((m, i) => (
+            <div
+              key={i}
+              style={{
+                display: 'flex',
+                justifyContent: m.role === 'user' ? 'flex-end' : 'flex-start',
+                marginBottom: '0.75rem',
+              }}
+            >
+              <div
+                style={{
+                  maxWidth: '80%',
+                  backgroundColor: m.role === 'user' ? NAVY : '#ffffff',
+                  color: m.role === 'user' ? '#ffffff' : '#111827',
+                  borderRadius: m.role === 'user' ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
+                  padding: '0.625rem 0.875rem',
+                  fontSize: '0.875rem',
+                  lineHeight: 1.5,
+                  boxShadow: '0 1px 3px rgba(0,0,0,0.07)',
+                }}
+              >
+                {m.role === 'user' ? m.text : (
+                  <ReactMarkdown
+                    components={{
+                      p: ({ children }) => <p style={{ margin: '0 0 0.4em' }}>{children}</p>,
+                      ul: ({ children }) => <ul style={{ margin: '0.2em 0', paddingLeft: '1.25em' }}>{children}</ul>,
+                      ol: ({ children }) => <ol style={{ margin: '0.2em 0', paddingLeft: '1.25em' }}>{children}</ol>,
+                      li: ({ children }) => <li style={{ marginBottom: '0.15em' }}>{children}</li>,
+                      strong: ({ children }) => <strong style={{ fontWeight: 700 }}>{children}</strong>,
+                      code: ({ children }) => <code style={{ backgroundColor: '#f1f5f9', borderRadius: '3px', padding: '1px 4px', fontSize: '0.82em' }}>{children}</code>,
+                    }}
+                  >
+                    {m.text}
+                  </ReactMarkdown>
+                )}
+              </div>
+            </div>
+          ))}
+          {loading && (
+            <div style={{ display: 'flex', justifyContent: 'flex-start', marginBottom: '0.75rem' }}>
+              <div style={{ backgroundColor: '#ffffff', borderRadius: '16px 16px 16px 4px', padding: '0.625rem 0.875rem', boxShadow: '0 1px 3px rgba(0,0,0,0.07)' }}>
+                <span style={{ display: 'inline-flex', gap: '4px', alignItems: 'center' }}>
+                  {[0,1,2].map(i => (
+                    <span key={i} style={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: '#9ca3af', animation: `bounce 1s ${i * 0.15}s infinite` }} />
+                  ))}
+                </span>
+              </div>
+            </div>
+          )}
+          <div ref={messagesEndRef} />
+        </div>
+      )}
 
       {/* Suggestions + input */}
       <div style={{ padding: '0 1.25rem 1.25rem', flexShrink: 0 }}>
-        <div
-          style={{
-            display: 'flex',
-            flexWrap: 'wrap',
-            gap: '0.5rem',
-            marginBottom: '0.75rem',
-            justifyContent: 'center',
-          }}
-        >
-          {SUGGESTIONS.map((s) => (
-            <button
-              key={s}
-              onClick={() => setInput(s)}
-              style={{
-                backgroundColor: '#ffffff',
-                border: '1px solid #d1d5db',
-                borderRadius: '999px',
-                padding: '0.4rem 0.875rem',
-                fontSize: '0.78rem',
-                color: '#374151',
-                cursor: 'pointer',
-                whiteSpace: 'nowrap',
-              }}
-            >
-              {s}
-            </button>
-          ))}
-        </div>
+        {!hasMessages && (
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginBottom: '0.75rem', justifyContent: 'center' }}>
+            {SUGGESTIONS.map((s) => (
+              <button
+                key={s}
+                onClick={() => sendMessage(s)}
+                style={{
+                  backgroundColor: '#ffffff',
+                  border: '1px solid #d1d5db',
+                  borderRadius: '999px',
+                  padding: '0.4rem 0.875rem',
+                  fontSize: '0.78rem',
+                  color: '#374151',
+                  cursor: 'pointer',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {s}
+              </button>
+            ))}
+          </div>
+        )}
 
         <div
           style={{
@@ -457,33 +578,23 @@ function ChatPanel({ firstName }) {
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder=""
-            style={{
-              flex: 1,
-              border: 'none',
-              outline: 'none',
-              fontSize: '0.9rem',
-              backgroundColor: 'transparent',
-              color: '#111827',
-            }}
+            onKeyDown={(e) => e.key === 'Enter' && sendMessage(input)}
+            placeholder="Ask me anything..."
+            style={{ flex: 1, border: 'none', outline: 'none', fontSize: '0.9rem', backgroundColor: 'transparent', color: '#111827' }}
           />
           <button
+            onClick={() => sendMessage(input)}
+            disabled={loading}
             style={{
-              width: '32px',
-              height: '32px',
-              borderRadius: '50%',
-              border: 'none',
-              backgroundColor: input.trim() ? NAVY : '#e5e7eb',
-              cursor: input.trim() ? 'pointer' : 'default',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              flexShrink: 0,
-              transition: 'background-color 0.2s',
+              width: '32px', height: '32px', borderRadius: '50%', border: 'none',
+              backgroundColor: input.trim() && !loading ? NAVY : '#e5e7eb',
+              cursor: input.trim() && !loading ? 'pointer' : 'default',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              flexShrink: 0, transition: 'background-color 0.2s',
             }}
           >
             <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
-              <path d="M13 7.5L2 2l2.5 5.5L2 13l11-5.5z" fill={input.trim() ? '#ffffff' : '#9ca3af'} />
+              <path d="M13 7.5L2 2l2.5 5.5L2 13l11-5.5z" fill={input.trim() && !loading ? '#ffffff' : '#9ca3af'} />
             </svg>
           </button>
         </div>
@@ -532,7 +643,7 @@ export default function DashboardPage() {
 
       {/* Right panel */}
       <div style={{ flex: 1, overflow: 'hidden' }}>
-        <ChatPanel firstName={firstName} />
+        <ChatPanel firstName={firstName} allTasks={allTasks} />
       </div>
     </div>
   )
