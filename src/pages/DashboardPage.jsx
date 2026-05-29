@@ -1,8 +1,9 @@
 import { useState, useMemo, useEffect, useCallback, useRef } from 'react'
 import ReactMarkdown from 'react-markdown'
 import canvasData from '../data/canvas-snapshot.json'
-import { initGoogleAuth, connectGoogleCalendar, isGoogleConnected, fetchCalendarEvents } from '../services/googleCalendar'
-import { auth } from '../firebase'
+import { initGoogleAuth, connectGoogleCalendar, isGoogleConnected, fetchCalendarEvents, createCalendarEvent } from '../services/googleCalendar'
+import { auth, db } from '../firebase'
+import { doc, getDoc } from 'firebase/firestore'
 
 function getMonday(date) {
   const d = new Date(date)
@@ -392,7 +393,7 @@ function WeeklyPanel({ courses, allTasks, onTaskClick, gcConnected, onConnectGC 
 // ─── Right Panel (AI Chat) ────────────────────────────────────────────────────
 
 
-function ChatPanel({ firstName, allTasks }) {
+function ChatPanel({ firstName, allTasks, gcConnected, userPrefs }) {
   const [input, setInput] = useState('')
   const [messages, setMessages] = useState([])
   const [loading, setLoading] = useState(false)
@@ -420,6 +421,71 @@ function ChatPanel({ firstName, allTasks }) {
     }).join('\n\n')
   }
 
+  const TOOLS = [
+    {
+      name: 'list_calendar_events',
+      description: 'Fetch the user\'s Google Calendar events between two dates. Use this when asked about schedule, availability, or what\'s on the calendar.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          start: { type: 'string', description: 'Start datetime in ISO 8601 format (e.g. 2026-05-26T00:00:00)' },
+          end: { type: 'string', description: 'End datetime in ISO 8601 format (e.g. 2026-06-02T23:59:59)' },
+        },
+        required: ['start', 'end'],
+      },
+    },
+    {
+      name: 'create_calendar_event',
+      description: 'Create a new event on the user\'s Google Calendar. Use this when the user asks to add, schedule, or block time for something.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: 'Event title' },
+          start: { type: 'string', description: 'Start datetime in ISO 8601 format' },
+          end: { type: 'string', description: 'End datetime in ISO 8601 format' },
+          description: { type: 'string', description: 'Optional event description' },
+        },
+        required: ['title', 'start', 'end'],
+      },
+    },
+  ]
+
+  const executeTool = async (name, input) => {
+    if (!gcConnected) return 'Google Calendar is not connected. Ask the user to connect it first.'
+    try {
+      if (name === 'list_calendar_events') {
+        const events = await fetchCalendarEvents(new Date(input.start), new Date(input.end))
+        if (!events.length) return 'No events found in that time range.'
+        return events.map(e => {
+          const start = e.start?.dateTime ? new Date(e.start.dateTime).toLocaleString() : e.start?.date
+          return `- ${e.summary || '(No title)'} at ${start}`
+        }).join('\n')
+      }
+      if (name === 'create_calendar_event') {
+        const event = await createCalendarEvent(input)
+        return `Event "${event.summary}" created successfully on ${new Date(event.start.dateTime).toLocaleString()}.`
+      }
+      return 'Unknown tool.'
+    } catch (err) {
+      return `Error: ${err.message}`
+    }
+  }
+
+  const callClaude = async (apiMessages, systemPrompt) => {
+    const res = await fetch('/api/claude', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 1024,
+        system: systemPrompt,
+        tools: gcConnected ? TOOLS : [],
+        messages: apiMessages,
+      }),
+    })
+    return res.json()
+  }
+
   const sendMessage = async (text) => {
     const userMsg = text.trim()
     if (!userMsg || loading) return
@@ -428,21 +494,56 @@ function ChatPanel({ firstName, allTasks }) {
     setMessages(newMessages)
     setLoading(true)
     try {
-      const systemPrompt = `You are Priorio, a helpful academic assistant for a student. You have access to their upcoming Canvas assignments:\n\n${buildContext()}\n\nToday's date is ${new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}. Help the student with questions about their assignments, due dates, study planning, and coursework. Be concise and friendly.`
+      const workStyleLabel = { longer: 'longer sessions (90+ min)', shorter: 'shorter bursts (25–45 min)', mixed: 'a mix of longer and shorter sessions' }
+      const prefsContext = userPrefs ? [
+        userPrefs.sleepFrom && userPrefs.sleepTo ? `Sleep schedule: ${userPrefs.sleepTo} (wake) to ${userPrefs.sleepFrom} (sleep)` : '',
+        userPrefs.focusTime ? `Preferred study/focus time: ${userPrefs.focusTime}` : '',
+        userPrefs.workStyle ? `Study style: prefers ${workStyleLabel[userPrefs.workStyle] || userPrefs.workStyle}` : '',
+      ].filter(Boolean).join('\n') : ''
 
-      const res = await fetch('/api/claude', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-haiku-4-5-20251001',
-          max_tokens: 1024,
-          system: systemPrompt,
-          messages: newMessages.map(m => ({ role: m.role, content: m.text })),
-        }),
-      })
-      const data = await res.json()
-      const reply = data?.content?.[0]?.text || 'Sorry, I couldn\'t get a response.'
-      setMessages(prev => [...prev, { role: 'assistant', text: reply }])
+      const systemPrompt = `You are Priorio, a helpful academic assistant for a student.
+
+CANVAS ASSIGNMENTS:
+${buildContext()}
+${prefsContext ? `\nSTUDENT PREFERENCES:\n${prefsContext}` : ''}
+
+Today's date is ${new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}.
+${gcConnected ? `
+SCHEDULING INSTRUCTIONS (follow these whenever the student asks about study time, scheduling, or availability):
+1. Always call list_calendar_events first to see what's already on their calendar for the relevant days.
+2. Find gaps between existing events that fall within their preferred focus time and outside their sleep hours.
+3. Suggest study blocks that fit their work style (${userPrefs?.workStyle === 'longer' ? '90+ min blocks' : userPrefs?.workStyle === 'shorter' ? '25–45 min blocks' : 'flexible block lengths'}).
+4. Avoid scheduling during sleep hours (${userPrefs?.sleepFrom || '11pm'} – ${userPrefs?.sleepTo || '7am'}).
+5. If the student confirms, call create_calendar_event to add the block.
+` : ''}
+Be concise and friendly.`
+
+      let apiMessages = newMessages.map(m => ({ role: m.role, content: m.text }))
+
+      // Agentic loop — keep going until no more tool calls
+      for (let i = 0; i < 5; i++) {
+        const data = await callClaude(apiMessages, systemPrompt)
+        if (data.error) throw new Error(data.error.message)
+
+        const toolUses = data.content?.filter(c => c.type === 'tool_use') || []
+
+        if (!toolUses.length) {
+          const reply = data.content?.find(c => c.type === 'text')?.text || 'Sorry, I couldn\'t get a response.'
+          setMessages(prev => [...prev, { role: 'assistant', text: reply }])
+          break
+        }
+
+        // Execute all tool calls in parallel
+        apiMessages.push({ role: 'assistant', content: data.content })
+        const toolResults = await Promise.all(
+          toolUses.map(async (tu) => ({
+            type: 'tool_result',
+            tool_use_id: tu.id,
+            content: await executeTool(tu.name, tu.input),
+          }))
+        )
+        apiMessages.push({ role: 'user', content: toolResults })
+      }
     } catch {
       setMessages(prev => [...prev, { role: 'assistant', text: 'Something went wrong. Please try again.' }])
     }
@@ -608,6 +709,7 @@ function ChatPanel({ firstName, allTasks }) {
 export default function DashboardPage() {
   const [selectedTask, setSelectedTask] = useState(null)
   const [gcConnected, setGcConnected] = useState(false)
+  const [userPrefs, setUserPrefs] = useState(null)
   const { courses, tasks: allTasks } = canvasData
   const firstName = auth.currentUser?.displayName?.split(' ')[0] ?? 'there'
 
@@ -620,6 +722,14 @@ export default function DashboardPage() {
       }
     }
     tryInit()
+  }, [])
+
+  useEffect(() => {
+    const uid = auth.currentUser?.uid
+    if (!uid) return
+    getDoc(doc(db, 'users', uid)).then(snap => {
+      if (snap.exists()) setUserPrefs(snap.data())
+    })
   }, [])
 
   return (
@@ -643,7 +753,7 @@ export default function DashboardPage() {
 
       {/* Right panel */}
       <div style={{ flex: 1, overflow: 'hidden' }}>
-        <ChatPanel firstName={firstName} allTasks={allTasks} />
+        <ChatPanel firstName={firstName} allTasks={allTasks} gcConnected={gcConnected} userPrefs={userPrefs} />
       </div>
     </div>
   )

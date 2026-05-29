@@ -16,6 +16,7 @@ export default defineConfig(({ mode }) => {
             req.on('data', chunk => { body += chunk })
             req.on('end', async () => {
               try {
+                const parsed = JSON.parse(body)
                 const response = await fetch('https://api.anthropic.com/v1/messages', {
                   method: 'POST',
                   headers: {
@@ -23,9 +24,10 @@ export default defineConfig(({ mode }) => {
                     'x-api-key': apiKey,
                     'anthropic-version': '2023-06-01',
                   },
-                  body,
+                  body: JSON.stringify(parsed),
                 })
                 const data = await response.json()
+                if (response.status !== 200) console.log('[claude proxy] error:', response.status, JSON.stringify(data))
                 res.setHeader('Content-Type', 'application/json')
                 res.statusCode = response.status
                 res.end(JSON.stringify(data))

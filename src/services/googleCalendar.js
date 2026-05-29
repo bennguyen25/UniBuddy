@@ -53,6 +53,27 @@ export async function fetchCalendarEvents(timeMin, timeMax) {
   return data.items || []
 }
 
+export async function createCalendarEvent({ title, start, end, description = '' }) {
+  if (!accessToken) throw new Error('Not connected to Google Calendar')
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone
+  const event = {
+    summary: title,
+    description,
+    start: { dateTime: new Date(start).toISOString(), timeZone: tz },
+    end: { dateTime: new Date(end).toISOString(), timeZone: tz },
+  }
+  const res = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(event),
+  })
+  if (!res.ok) {
+    const err = await res.json()
+    throw new Error(err.error?.message || 'Failed to create event')
+  }
+  return res.json()
+}
+
 export async function addToGoogleCalendar(task) {
   if (!accessToken) throw new Error('Not connected to Google Calendar')
 
